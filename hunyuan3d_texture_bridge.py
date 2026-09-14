@@ -799,7 +799,6 @@ def texture_mesh(args):
     def _delight_call_patched(self, image):
         import numpy as _np
         import cv2 as _cv2
-        _original = image.copy()
         image = image.resize((512, 512))
         if image.mode == 'RGBA':
             image_array = _np.array(image)
@@ -827,15 +826,23 @@ def texture_mesh(args):
         # restricted to the subject so the white background doesn't dilute it,
         # and the delight model's signature black silhouette outline is erased
         # before it can propagate into every diffusion view and the bake.
-        _orig_resized = _original.convert("RGB").resize((512, 512))
+        #
+        # IMPORTANT: the anchor is the FRONT reference's subject palette, NOT
+        # this view's own original.  Matching each side view back to its own
+        # original re-imposed that view's directional lighting on top of the
+        # delight pass (dark MV-Adapter side views came back dark), so the
+        # diffusion model then painted near-black sides that no normalisation
+        # step can recover texture from.  A gentle strength here only keeps
+        # the global palette honest; per-view lighting equalisation happens
+        # later in the luminance-balance step.
         image = _remove_silhouette_outline(image)
         try:
-            _dm = _subject_silhouette(np.array(_orig_resized))
+            _dm = _subject_silhouette(np.array(image))
             if not (0.02 < float(_dm.mean()) < 0.98):
                 _dm = None
         except Exception:
             _dm = None
-        image = _histogram_match_pil(image, _orig_resized, mask=_dm, strength=0.85)
+        image = _histogram_match_pil(image, _source_histogram_ref, mask=_dm, strength=0.5)
         return image
 
     _delight_module.Light_Shadow_Remover.__call__ = _delight_call_patched
@@ -1406,6 +1413,48 @@ def texture_mesh(args):
     for _i, (_v, _n) in enumerate(zip(multiviews, _mv_names)):
         _v.save(os.path.join(_debug_dir, f"03b_normalized_{_i}_{_n}.png"))
     print(json.dumps({"type": "log", "message": _norm_log}), flush=True)
+
+    # ── Background extension: push subject colour outward ─────────────────
+    # Texels on the mesh silhouette boundary project onto view pixels right
+    # at (and just outside) the subject edge, where anti-aliasing and the
+    # flat backdrop live — that is exactly the white/gray piping visible on
+    # every silhouette in the render.  Extend the subject's own colour a few
+    # pixels into the background (nearest-subject-pixel fill via a distance
+    # transform) so boundary texels read real surface colour.
+    try:
+        import cv2 as _cv2_be
+        _ext = max(2, RENDER_RES // 256)
+        _new = []
+        for _vi, _v in enumerate(multiviews):
+            _a = np.array(_v.convert("RGB"))
+            _m = _fg_masks[_vi]
+            if _m is None:
+                try:
+                    _m = _subject_silhouette(_a)
+                    if not (0.02 < float(_m.mean()) < 0.98):
+                        _new.append(_v)
+                        continue
+                except Exception:
+                    _new.append(_v)
+                    continue
+            # ring = background pixels within _ext of the subject edge
+            _ring = (_cv2_be.dilate(_m.astype(np.uint8),
+                                    np.ones((3, 3), np.uint8),
+                                    iterations=_ext) - _m.astype(np.uint8)).astype(np.uint8) * 255
+            if _ring.sum() == 0:
+                _new.append(_v)
+                continue
+            # Telea inpaint fills the ring from its boundaries; pixels next to
+            # the subject edge take the subject's colour, which is all the
+            # bake's boundary texels ever sample.
+            _a = _cv2_be.inpaint(_a, _ring, _ext, _cv2_be.INPAINT_TELEA)
+            _new.append(Image.fromarray(_a))
+        multiviews = _new
+        print(json.dumps({"type": "log", "message":
+            f"[texture] subject colour extended {_ext}px into background (silhouette piping fix)"}), flush=True)
+    except Exception as _be_err:
+        print(json.dumps({"type": "log", "message":
+            f"[texture] background extension skipped: {_be_err}"}), flush=True)
 
     # ── Stage 5: Bake textures + inpaint (runs on GPU) ───────────────────
     report(75, "Baking texture atlas", "merging projected views")
