@@ -157,6 +157,22 @@ def _composite_on_white(img):
     # RGB path: try to remove any existing background so the diffusion model
     # always sees the object on white rather than on the original backdrop.
     rgb = img.convert("RGB")
+    # Fast path for SYNTHETIC views (MV-Adapter grid quadrants, folder
+    # renders): if the border is one flat colour, the corner flood-fill gives
+    # an exact matte with no neural model involved. rembg's u2net weights
+    # download lazily and a silent failure used to pass the gray 128 backdrop
+    # through — gray patches then bled into any mesh silhouette pixel the
+    # reference didn't cover.
+    _arr = np.array(rgb)
+    _corners = np.stack([_arr[0, 0], _arr[0, -1], _arr[-1, 0], _arr[-1, -1]]).astype(int)
+    _edge = np.concatenate([_arr[0].reshape(-1, 3), _arr[-1].reshape(-1, 3),
+                            _arr[:, 0].reshape(-1, 3), _arr[:, -1].reshape(-1, 3)]).astype(int)
+    if ((_corners.max(0) - _corners.min(0)).max() <= 18 and _edge.std(0).max() <= 14):
+        _fg = _subject_silhouette(_arr)
+        if 0.02 < float(_fg.mean()) < 0.98:
+            _out = _arr.copy()
+            _out[~_fg] = 255
+            return Image.fromarray(_out)
     try:
         from rembg import remove, new_session
         sess = new_session(providers=["CPUExecutionProvider"])
@@ -270,20 +286,68 @@ def _silhouette_contour(sil_mask, n=128):
     return c[idx] + frac[:, None] * (nxt - c[idx])
 
 
+def _polar_contour(sil_mask, n=128):
+    """Silhouette boundary resampled at uniform POLAR angle around the area
+    centroid.  This is the correspondence anchor for the TPS warp: arc-length
+    anchoring keys point #0 to wherever cv2 happened to start tracing, so two
+    silhouettes of the same object (photo cutout vs mesh render) routinely end
+    up matching the chair top against a leg — the interior then collapses into
+    the smeared blobs we saw in the bake.  Polar anchoring is stable for any
+    upright camera pair; non star-shaped spans fall back to max radius."""
+    import cv2 as _cv
+    sil_u8 = (sil_mask.astype(np.uint8)) * 255
+    contours, _ = _cv.findContours(sil_u8, _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    c = max(contours, key=_cv.contourArea).reshape(-1, 2).astype(np.float64)
+    ys, xs = np.where(sil_mask)
+    if len(xs) == 0:
+        return None
+    cx, cy = float(xs.mean()), float(ys.mean())
+    ang = np.arctan2(c[:, 1] - cy, c[:, 0] - cx)
+    radius = np.hypot(c[:, 0] - cx, c[:, 1] - cy)
+    edges = np.linspace(-np.pi, np.pi, n + 1)
+    bins = np.clip(np.digitize(ang, edges) - 1, 0, n - 1)
+    r_b = np.zeros(n)
+    np.maximum.at(r_b, bins, radius)
+    cnt = np.bincount(bins, minlength=n)
+    has = cnt > 0
+    if not has.any():
+        return None
+    if not has.all():
+        filled = np.where(has)[0]
+        for i in np.where(~has)[0]:
+            d = np.abs(filled - i)
+            r_b[i] = r_b[filled[d.argmin()]]
+    a_c = (edges[:-1] + edges[1:]) / 2
+    return np.stack([cx + r_b * np.cos(a_c), cy + r_b * np.sin(a_c)], axis=1)
+
+
 def _deform_view_to_silhouette(ref_img, pos_img, out_size):
     """Warp a reference view so its subject silhouette matches the mesh's.
 
-    Uses a thin-plate spline fit on corresponding arc-length points of the two
-    outer contours, then samples the reference image through it. Output is the
-    warped subject composited on white, masked to the mesh silhouette. If the
-    warp can't be fit, returns the reference resized unchanged (the bake will
-    still project it, just without silhouette correction).
+    Two candidate warps are computed and the better one wins, scored by the
+    IoU between the warped subject and the mesh silhouette:
+
+      1. bbox-similarity warp: scale+translate the subject bbox onto the mesh
+         bbox.  Rigid (no local bending) so it can never melt — the floor.
+      2. TPS on polar-angle contour correspondence: smooth bending that also
+         fixes shape differences.  The old arc-length correspondence keyed
+         point 0 to cv2's arbitrary contour start pixel, which mapped top to
+         side and collapsed the interior into smeared blobs; polar anchoring
+         is start-pixel independent.
+
+    Output is the warped subject composited on white, masked to the mesh
+    silhouette.  Raises ValueError when even the best warp matches poorly
+    (<0.30 IoU) so callers can fall back to diffusion/raw views instead of
+    baking garbage.
     """
     import cv2 as _cv
     from skimage.transform import ThinPlateSplineTransform, warp as _skwarp
 
-    ref = ref_img.convert("RGB").resize((out_size, out_size), Image.LANCZOS)
-    ref_np = np.asarray(ref).astype(np.float32)
+    ref_pil = ref_img.convert("RGB").resize((out_size, out_size), Image.LANCZOS)
+    ref_np = np.asarray(ref_pil).astype(np.float32)
+    ref_u8 = np.asarray(ref_pil)
 
     mesh_sil = _mesh_silhouette_from_pos(pos_img)
     if (mesh_sil.shape[0], mesh_sil.shape[1]) != (out_size, out_size):
@@ -291,33 +355,65 @@ def _deform_view_to_silhouette(ref_img, pos_img, out_size):
             (out_size, out_size), Image.NEAREST)
         mesh_sil = np.asarray(_u8) > 0
     if not mesh_sil.any():
-        return ref  # no mesh visible from this camera — nothing to align to
+        return ref_pil  # no mesh visible from this camera — nothing to align to
 
-    ref_sil = _subject_silhouette(ref_np.astype(np.uint8))
+    ref_sil = _subject_silhouette(ref_u8)
     if not ref_sil.any():
-        return ref
+        return ref_pil
 
-    ref_pts = _silhouette_contour(ref_sil)
-    mesh_pts = _silhouette_contour(mesh_sil)
-    if ref_pts is None or mesh_pts is None or len(ref_pts) < 16 or len(mesh_pts) < 16:
-        return ref
+    def _iou(cand_u8):
+        cs = _subject_silhouette(cand_u8)
+        inter = np.logical_and(cs, mesh_sil).sum()
+        union = np.logical_or(cs, mesh_sil).sum()
+        return float(inter) / max(float(union), 1.0)
 
-    # tps maps mesh-silhouette points -> reference-silhouette points, so
-    # warp(ref, inverse_map=tps) samples the reference at each mesh pixel.
-    tps = ThinPlateSplineTransform()
-    try:
+    # ── floor: bbox similarity warp (dst->src inverse affine) ─────────────
+    ry, rx = np.where(ref_sil)
+    my, mx = np.where(mesh_sil)
+    r_cx, r_cy = (rx.min() + rx.max()) / 2.0, (ry.min() + ry.max()) / 2.0
+    m_cx, m_cy = (mx.min() + mx.max()) / 2.0, (my.min() + my.max()) / 2.0
+    sx = (rx.max() - rx.min() + 1) / max(mx.max() - mx.min() + 1, 1)
+    sy = (ry.max() - ry.min() + 1) / max(my.max() - my.min() + 1, 1)
+    # Scale sanity: the renderer fits the mesh to frame and MV-Adapter frames
+    # its subjects to 90%, so a legit reference-vs-mesh area ratio is ~1.
+    # Anything beyond ~4x one way means the "mesh silhouette" is a speck or
+    # covers the whole frame (broken position map) — no warp can fix that,
+    # and IoU is blind to it since scaling can force silhouettes to agree.
+    if not (0.22 <= (sx * sy) <= 4.5):
+        raise ValueError(f"mesh/reference area scale insane (sx={sx:.2f}, sy={sy:.2f})")
+    M_inv = np.float32([[sx, 0, r_cx - sx * m_cx], [0, sy, r_cy - sy * m_cy]])
+    best = _cv.warpAffine(ref_u8, M_inv, (out_size, out_size),
+                          flags=_cv.INTER_LINEAR, borderMode=_cv.BORDER_CONSTANT,
+                          borderValue=(255, 255, 255))
+    best_iou = _iou(best)
+    how = f"bbox(iou={best_iou:.2f})"
+
+    # ── refinement: TPS on polar correspondence ────────────────────────────
+    ref_pts = _polar_contour(ref_sil)
+    mesh_pts = _polar_contour(mesh_sil)
+    if ref_pts is not None and mesh_pts is not None:
         try:
-            tps = ThinPlateSplineTransform.from_estimate(src=mesh_pts, dst=ref_pts)
-        except AttributeError:  # skimage < 0.26
-            tps.estimate(src=mesh_pts, dst=ref_pts)
-    except Exception:
-        return ref
+            try:
+                tps = ThinPlateSplineTransform.from_estimate(src=mesh_pts, dst=ref_pts)
+            except AttributeError:  # skimage < 0.26
+                tps = ThinPlateSplineTransform()
+                tps.estimate(src=mesh_pts, dst=ref_pts)
+            w = _skwarp(ref_np, inverse_map=tps, output_shape=(out_size, out_size),
+                        order=1, mode="constant", cval=255.0, clip=True)
+            w = np.clip(w, 0, 255).astype(np.uint8)
+            iou_t = _iou(w)
+            if iou_t > best_iou + 0.02:
+                best, best_iou, how = w, iou_t, f"tps-polar(iou={iou_t:.2f})"
+        except Exception:
+            pass
 
-    warped = _skwarp(ref_np, inverse_map=tps, output_shape=(out_size, out_size),
-                     order=1, mode="constant", cval=255.0, clip=True)
-    warped = np.clip(warped, 0, 255).astype(np.uint8)
+    if best_iou < 0.30:
+        raise ValueError(f"silhouette match too poor after warp ({how})")
+
     out = np.full((out_size, out_size, 3), 255, np.uint8)
-    out[mesh_sil] = warped[mesh_sil]
+    out[mesh_sil] = best[mesh_sil]
+    print(json.dumps({"type": "log", "message":
+        f"[warp] mesh-silhouette alignment: {how}"}), flush=True)
     return Image.fromarray(out, "RGB")
 
 
