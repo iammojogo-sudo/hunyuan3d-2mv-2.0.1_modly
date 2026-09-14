@@ -211,7 +211,12 @@ def _subject_silhouette(img_np, tol=None):
     border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]], axis=0)
     med = np.median(border, axis=0)
     p90 = float(np.percentile(np.abs(border - med).max(axis=1), 90))
-    T = float(tol) if tol else max(18.0, min(60.0, 1.5 * p90 + 10.0))
+    # Wider than the border's own spread: a radial vignette is darkest at the
+    # corners (on the border) and brightest at the centre (never sampled), so
+    # the threshold must exceed the border p90 to swallow the whole backdrop.
+    # Genuinely low-contrast subjects (gray-on-gray) get swallowed too — the
+    # coverage guards then fall back gracefully instead of corrupting.
+    T = float(tol) if tol else max(30.0, min(90.0, 3.0 * p90 + 20.0))
     dist = np.abs(arr - med).max(axis=2)
     bg = (dist < T).astype(np.uint8)
     _n, lab = _cv.connectedComponents(bg)
