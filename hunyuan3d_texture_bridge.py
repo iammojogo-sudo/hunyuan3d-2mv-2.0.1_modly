@@ -145,14 +145,21 @@ def _flatten_texture(pil_img, strength=0.8):
 def _composite_on_white(img):
     """Return an RGB image with the input composited onto a white background.
 
-    RGBA inputs use their alpha channel. RGB inputs are passed through unless
-    they look like they have a dark/solid background, in which case rembg is
-    used to extract the foreground first.
+    RGBA inputs use their alpha channel — unless alpha is mostly opaque (>95%),
+    in which case the image is treated as RGB and the background is segmented
+    out (handles MV-Adapter grids with fully-opaque alpha + gray backdrop).
+    RGB inputs are passed through unless they look like they have a dark/solid
+    background, in which case rembg is used to extract the foreground first.
     """
     if img.mode == "RGBA":
-        white = Image.new("RGB", img.size, (255, 255, 255))
-        white.paste(img, mask=img.getchannel("A"))
-        return white
+        alpha = np.array(img.getchannel("A"))
+        if float((alpha > 250).mean()) > 0.95:
+            # Opaque alpha = treat as RGB, segment the background
+            img = img.convert("RGB")
+        else:
+            white = Image.new("RGB", img.size, (255, 255, 255))
+            white.paste(img, mask=img.getchannel("A"))
+            return white
 
     # RGB path: try to remove any existing background so the diffusion model
     # always sees the object on white rather than on the original backdrop.
