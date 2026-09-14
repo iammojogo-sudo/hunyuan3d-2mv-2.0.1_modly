@@ -451,20 +451,6 @@ def _deform_view_to_silhouette(ref_img, pos_img, out_size):
     return Image.fromarray(out, "RGB")
 
 
-def _deform_multiview(cond_views, position_maps, out_size):
-    """Deform each reference view to match the mesh's silhouette from the same
-    camera angle. cond_views and position_maps are ordered identically."""
-    out = []
-    for i, (cv_img, pos_img) in enumerate(zip(cond_views, position_maps)):
-        _touch_activity()
-        try:
-            out.append(_deform_view_to_silhouette(cv_img, pos_img, out_size))
-        except Exception as _e:
-            print(json.dumps({"type": "log", "message": f"[deform] view {i} failed ({_e}), using raw view"}), flush=True)
-            out.append(cv_img.convert("RGB").resize((out_size, out_size), Image.LANCZOS))
-    return out
-
-
 def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
     """Per-view hybrid assembly: views backed by a real reference carry the
     full-resolution ORIGINAL pixels warped onto the mesh silhouette with the
@@ -593,6 +579,9 @@ def texture_mesh(args):
       render normal/position multiviews -> delight conditioning image ->
       multiview diffusion -> bake textures -> inpaint -> export GLB.
     """
+    BRIDGE_BUILD = "2026-09-14-deform-retired"
+    print(json.dumps({"type": "log", "message":
+        f"[texture] bridge build {BRIDGE_BUILD}"}), flush=True)
     _bridge_first_load(args)
 
     mesh_path = args.get("mesh_path", "")
@@ -620,10 +609,16 @@ def texture_mesh(args):
 
     # Texture generation method.
     #   diffusion: Hunyuan3D-2 multiview diffusion (512px ceiling).
-    #   deform:    warp the wired reference views to the mesh silhouettes and
-    #              bake them directly — no diffusion, full reference resolution.
+    #   hybrid:    diffusion for unreferenced views + full-res originals
+    #              warped onto the mesh silhouettes for referenced views.
+    #   deform:    RETIRED — aliased to hybrid (same warp, plus diffusion
+    #              fills top/bottom instead of leaving them to inpaint).
     texture_method = str(args.get("texture_method", "diffusion") or "diffusion").lower()
-    if texture_method not in ("diffusion", "hybrid", "deform"):
+    if texture_method == "deform":
+        print(json.dumps({"type": "log", "message":
+            "[texture] 'deform' retired — running 'hybrid' (same warp + diffusion fill)"}), flush=True)
+        texture_method = "hybrid"
+    if texture_method not in ("diffusion", "hybrid"):
         texture_method = "diffusion"
 
     # How many reference images we are feeding the diffusion model. 1 = whole
@@ -661,11 +656,7 @@ def texture_mesh(args):
     _num_known = min(len(cond_views), 6)
     for _i in range(_num_known):
         _dynamic_weights[_i] = _known_weights[_i]
-    if texture_method == "deform":
-        # Deformed views are ground-truth references (not synthesized), so every
-        # provided view gets full weight at the view boundaries.
-        _dynamic_weights = [1.0] * 6
-    elif texture_method == "hybrid":
+    if texture_method == "hybrid":
         # Hybrid reference-backed views are ground-truth originals (TPS-wrapped
         # to the mesh silhouette), so they take full bake weight. Views past the
         # reference count are diffusion output and keep the graduated weights.
@@ -921,19 +912,7 @@ def texture_mesh(args):
     # class so only the multiview model is built, and make cpu-offload skip the
     # missing delight model. This meaningfully lowers the VRAM/RAM ceiling on
     # 6 GB cards where the delight model is never used anyway.
-    if texture_method == "deform":
-        # Deform mode doesn't run diffusion at all — skip loading EVERY paint
-        # model (~5 GB saved). The renderer (built in __init__) is all we need.
-        def _load_models_none(self):
-            torch.cuda.empty_cache()
-
-        def _offload_none(self, gpu_id=None, device="cuda"):
-            pass
-
-        _HPP_cls.load_models = _load_models_none
-        _HPP_cls.enable_model_cpu_offload = _offload_none
-        print(json.dumps({"type": "log", "message": "[texture] deform mode — skipping all paint model loads"}), flush=True)
-    elif delight != "on":
+    if delight != "on":
         from hy3dgen.texgen.utils.multiview_utils import Multiview_Diffusion_Net as _MVNet
 
         def _load_models_no_delight(self):
@@ -1280,17 +1259,9 @@ def texture_mesh(args):
     position_maps = pipeline.render_position_multiview(elevs, azims)
 
     # ── Stage 4: Generate texture views ──────────────────────────────────
+    # (deform mode retired — aliased to hybrid at arg-parse time)
     if texture_method == "deform":
-        report(58, "Deforming reference views", "warping views to mesh silhouettes")
-        if len(cond_views) < 6:
-            print(json.dumps({"type": "log", "message":
-                f"[texture] deform mode has {len(cond_views)}/6 views — bake will cover "
-                f"only the first {len(cond_views)} camera angles; top/bottom get inpainted"}), flush=True)
-        multiviews = _deform_multiview(cond_views, position_maps, RENDER_RES)
-        del cond_views, normal_maps, position_maps
-        gc.collect()
-        torch.cuda.empty_cache()
-        report(72, "Views deformed to mesh", "baking next")
+        raise RuntimeError("deform mode retired; should have been aliased to hybrid")
     else:
         # ── Stage 4a: Multiview diffusion ─────────────────────────────────
         # The multiview UNet (~3.5 GB) is the biggest CPU RAM consumer. After
