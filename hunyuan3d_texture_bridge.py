@@ -158,16 +158,16 @@ def _composite_on_white(img):
     # always sees the object on white rather than on the original backdrop.
     rgb = img.convert("RGB")
     # Fast path for SYNTHETIC views (MV-Adapter grid quadrants, folder
-    # renders): if the border is one flat colour, the corner flood-fill gives
-    # an exact matte with no neural model involved. rembg's u2net weights
-    # download lazily and a silent failure used to pass the gray 128 backdrop
-    # through — gray patches then bled into any mesh silhouette pixel the
-    # reference didn't cover.
+    # renders): a flat/vignetted solid backdrop is segmented exactly by the
+    # border-median rule — no neural model involved. rembg's u2net returns an
+    # all-opaque matte on synthetic cutouts, which silently passed the gray
+    # 128 backdrop through; gray-backdrop references are out-of-distribution
+    # for the paint model and made it hallucinate black/zebra side views.
     _arr = np.array(rgb)
-    _corners = np.stack([_arr[0, 0], _arr[0, -1], _arr[-1, 0], _arr[-1, -1]]).astype(int)
-    _edge = np.concatenate([_arr[0].reshape(-1, 3), _arr[-1].reshape(-1, 3),
-                            _arr[:, 0].reshape(-1, 3), _arr[:, -1].reshape(-1, 3)]).astype(int)
-    if ((_corners.max(0) - _corners.min(0)).max() <= 18 and _edge.std(0).max() <= 14):
+    _border = np.concatenate([_arr[0, :], _arr[-1, :], _arr[:, 0], _arr[:, -1]]).astype(int)
+    _med = np.median(_border, axis=0)
+    _p90 = float(np.percentile(np.abs(_border - _med).max(axis=1), 90))
+    if _p90 <= 25:
         _fg = _subject_silhouette(_arr)
         if 0.02 < float(_fg.mean()) < 0.98:
             _out = _arr.copy()
@@ -188,26 +188,42 @@ def _composite_on_white(img):
         return rgb
 
 
-def _subject_silhouette(img_np, tol=15):
-    """Extract a foreground silhouette from an RGB image on a uniform background.
+def _subject_silhouette(img_np, tol=None):
+    """Foreground mask of a subject on a uniform (possibly vignetted) backdrop.
 
-    Flood-fills the background from the 4 image corners, returns a boolean mask
-    that is True where the subject is.  Uses FLOODFILL_FIXED_RANGE so the
-    tolerance is measured against the CORNER colour, not each neighbour pixel —
-    without it, the model's soft anti-aliased edge ramp (a gradual 128->230
-    gradient over a few px) leaks the fill straight through the silhouette.
+    Corner flood-fill (even with FLOODFILL_FIXED_RANGE) breaks on the mild
+    radial vignette of model-rendered backgrounds: every corner seed only
+    fills pixels near its OWN brightness, so background bands survive inside
+    the "subject" mask — which poisoned the masked normalisation stats, the
+    outline cleanup, the warp masks and the white-composite fast path
+    (references kept their gray backdrop and the paint model hallucinated
+    black/zebra sides from the out-of-distribution conditioning).
+
+    New rule: background = pixels within an adaptive colour distance of the
+    BORDER MEDIAN that are connected to the image border; subject = the rest.
+    The threshold uses the p90 of border deviation, not the median: a photo
+    with a shadow touching one edge has a BIMODAL border whose median
+    deviation stays tiny while p90 exposes the second colour (that is what
+    keeps real photos on the rembg path in _composite_on_white).
     """
     import cv2 as _cv
-    h, w = img_np.shape[:2]
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    work = img_np.astype(np.uint8)
-    for pt in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
-        _cv.floodFill(
-            work, mask, (int(pt[1]), int(pt[0])), 0,
-            loDiff=(tol,) * 3, upDiff=(tol,) * 3,
-            flags=8 | _cv.FLOODFILL_FIXED_RANGE | _cv.FLOODFILL_MASK_ONLY | (1 << 8),
-        )
-    return mask[1:-1, 1:-1] == 0  # unfilled region = subject
+    arr = img_np.astype(np.int16)
+    border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]], axis=0)
+    med = np.median(border, axis=0)
+    p90 = float(np.percentile(np.abs(border - med).max(axis=1), 90))
+    T = float(tol) if tol else max(18.0, min(60.0, 1.5 * p90 + 10.0))
+    dist = np.abs(arr - med).max(axis=2)
+    bg = (dist < T).astype(np.uint8)
+    _n, lab = _cv.connectedComponents(bg)
+    edge_labels = np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]]))
+    edge_labels = edge_labels[edge_labels != 0]
+    if len(edge_labels):
+        bg = np.isin(lab, edge_labels).astype(np.uint8)
+    fg = (1 - bg).astype(np.uint8)
+    k = np.ones((3, 3), np.uint8)
+    fg = _cv.morphologyEx(fg, _cv.MORPH_OPEN, k, iterations=1)
+    fg = _cv.morphologyEx(fg, _cv.MORPH_CLOSE, k, iterations=1)
+    return fg.astype(bool)
 
 
 def _remove_silhouette_outline(pil_img, band=None, abs_lum_cap=45):
@@ -412,6 +428,19 @@ def _deform_view_to_silhouette(ref_img, pos_img, out_size):
 
     out = np.full((out_size, out_size, 3), 255, np.uint8)
     out[mesh_sil] = best[mesh_sil]
+    # Interior holes: mesh-silhouette regions the reference view does not
+    # cover (thinner/offset legs, extra arm area) would otherwise keep the
+    # flat backdrop colour and bake as gray patches or "metallic" legs.
+    # Inpaint them from the surrounding real subject pixels.
+    try:
+        _wsub = _subject_silhouette(out)
+        _holes = (mesh_sil & ~_wsub).astype(np.uint8)
+        if 0 < int(_holes.sum()) < int(0.35 * mesh_sil.sum()):
+            _holes = _cv.dilate(_holes, np.ones((3, 3), np.uint8), iterations=1)
+            out = _cv.inpaint(out, _holes * 255, max(3, out_size // 128),
+                              _cv.INPAINT_TELEA)
+    except Exception:
+        pass
     print(json.dumps({"type": "log", "message":
         f"[warp] mesh-silhouette alignment: {how}"}), flush=True)
     return Image.fromarray(out, "RGB")
