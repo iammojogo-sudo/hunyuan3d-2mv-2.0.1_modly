@@ -514,6 +514,29 @@ def _sil_match_score(ref_img, pos_img, out_size):
     return inter / max(union, 1.0)
 
 
+def _guided_blend(warped_np, diff_np, mesh_sil):
+    """Per-pixel blend between a warped reference and the diffusion view using
+    LAB-similarity as a confidence map.  Where the two agree (same fabric
+    color, aligned detail) the reference's real pixels are kept; where they
+    disagree (misaligned edges, background bleed, projection offset) the
+    diffusion view's correct geometry wins.  Smooth Gaussian feathering at
+    silhouette boundaries eliminates any hard transition artefacts."""
+    import cv2 as _cv2_gb
+    warped_lab = _cv2_gb.cvtColor(warped_np, _cv2_gb.COLOR_RGB2LAB).astype(np.float32)
+    diff_lab = _cv2_gb.cvtColor(diff_np, _cv2_gb.COLOR_RGB2LAB).astype(np.float32)
+    dist = np.sqrt(np.sum((warped_lab - diff_lab) ** 2, axis=2))
+    # sigma=30 LAB units: below that is "same fabric", above is "mismatch"
+    conf = np.exp(-dist / 30.0)
+    conf = np.where(mesh_sil, conf, 0.0).astype(np.float32)
+    # Feather at silhouette boundary
+    _h, _w = conf.shape
+    _k = max(3, min(_h, _w) // 128 * 3) | 1
+    conf = _cv2_gb.GaussianBlur(conf, (_k, _k), 0)
+    conf = np.clip(conf, 0.0, 1.0)[..., None]
+    blended = warped_np.astype(np.float32) * conf + diff_np.astype(np.float32) * (1.0 - conf)
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
 def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
     """Per-view hybrid assembly: views backed by a real reference carry the
     full-resolution ORIGINAL pixels warped onto the mesh silhouette with the
@@ -556,8 +579,17 @@ def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
                 cov = float(np.logical_and(mesh_sil, wsub).sum()) / max(float(mesh_sil.sum()), 1.0)
                 iou = float(np.logical_and(wsub, mesh_sil).sum()) / max(
                     float(np.logical_or(wsub, mesh_sil).sum()), 1.0)
-                if cov >= 0.90 and iou >= 0.60:
-                    out.append(warped)
+                if cov >= 0.85 and iou >= 0.50:
+                    # Warp passes gate — but still blend with diffusion
+                    # for alignment safety: the warped reference brings real
+                    # fabric color/detail, the diffusion view brings correct
+                    # geometry; the guided blend keeps the best of both.
+                    try:
+                        blended = _guided_blend(
+                            np.array(warped), np.array(fallback), mesh_sil)
+                        out.append(Image.fromarray(blended))
+                    except Exception:
+                        out.append(warped)
                     continue
                 print(json.dumps({"type": "log", "message":
                     f"[hybrid] view {i} warp rejected (cov={cov:.2f}, iou={iou:.2f}) "
@@ -669,7 +701,7 @@ def texture_mesh(args):
       render normal/position multiviews -> delight conditioning image ->
       multiview diffusion -> bake textures -> inpaint -> export GLB.
     """
-    BRIDGE_BUILD = "2026-09-14-blendfix"
+    BRIDGE_BUILD = "2026-09-14-alignment"
     print(json.dumps({"type": "log", "message":
         f"[texture] bridge build {BRIDGE_BUILD}"}), flush=True)
     _bridge_first_load(args)
@@ -695,7 +727,8 @@ def texture_mesh(args):
 
     # Flatten texture: remove all shadows/highlights from the baked texture
     # to produce a flat albedo suitable for PBR lighting.
-    flatten_texture = str(args.get("flatten_texture", "off") or "off").lower() == "on"
+    # Flatten texture: RETIRED — normalization + delight handle lighting.
+    flatten_texture = False
 
     # Texture generation method.
     #   diffusion: Hunyuan3D-2 multiview diffusion (512px ceiling).
@@ -1329,6 +1362,25 @@ def texture_mesh(args):
     # reference images as-is. Deform mode always skips it (model not loaded).
     if delight == "on" and texture_method != "deform":
         report(40, "Delighting reference views", f"removing shadows/highlights from {len(cond_views)} view(s)")
+        # Isolate subjects onto clean white backgrounds before delight so that
+        # delight's colour stats and the subsequent masked match are computed
+        # on the subject alone — not contaminated by backdrop pixels.
+        try:
+            from rembg import remove as _rembg_delight
+            _cleaned = []
+            for _v in cond_views:
+                try:
+                    _rgba = _rembg_delight(_v.convert("RGB"))
+                    _white = Image.new("RGB", _v.size, (255, 255, 255))
+                    _white.paste(_rgba, mask=_rgba.getchannel("A"))
+                    _cleaned.append(_white)
+                except Exception:
+                    _cleaned.append(_v.convert("RGB"))
+            cond_views = _cleaned
+            print(json.dumps({"type": "log", "message":
+                f"[texture] rembg-isolated {len(cond_views)} views before delight"}), flush=True)
+        except ImportError:
+            pass  # rembg not available; proceed without isolation
         cond_views = [pipeline.recenter_image(v.convert("RGB")) for v in cond_views]
         cond_views = [pipeline.models["delight_model"](v) for v in cond_views]
         for _i, (_v, _n) in enumerate(zip(cond_views, _view_names)):
@@ -1352,10 +1404,12 @@ def texture_mesh(args):
     # fewer, larger charts so the atlas has less black space to inpaint.
     # max_cost scales with face count — high-poly meshes need much more
     # aggressive merging to avoid hundreds of scattered micro-charts.
+    # Raising the upper bound and iteration count directly targets the
+    # 38% hole fraction observed with the previous conservative settings.
     _nfaces = len(mesh.faces)
-    _mc = max(8.0, min(64.0, _nfaces / 200.0))
+    _mc = max(8.0, min(256.0, _nfaces / 80.0))
     mesh = mesh_uv_wrap(mesh, atlas_size=TEXTURE_SIZE, padding=2,
-                        max_cost=_mc, max_iterations=3, rotate_charts=True)
+                        max_cost=_mc, max_iterations=5, rotate_charts=True)
     _uvs = getattr(mesh, "metadata", {}).get("uv_stats")
     if _uvs:
         print(json.dumps({"type": "log", "message":
@@ -1663,7 +1717,8 @@ def texture_mesh(args):
     # Flatten texture: remove all shadows/highlights to produce flat albedo.
     # Runs before final colour correction so the flatten doesn't undo the
     # histogram matching.
-    if flatten_texture:
+    # Flatten texture: RETIRED — normalization + delight handle lighting.
+    if False:  # flatten_texture removed
         try:
             _final_pil = Image.fromarray(_final)
             _final_pil = _flatten_texture(_final_pil, strength=1.0)

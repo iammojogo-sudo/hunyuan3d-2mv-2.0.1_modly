@@ -297,23 +297,6 @@
           "tooltip": "Remove all shadows and highlights from the reference image before texturing. Includes aggressive flattening to produce a pure albedo with no directional lighting. Strongly recommended for PBR workflows."
         },
         {
-          "id": "flatten_texture",
-          "label": "Flatten Texture (Post-Bake)",
-          "type": "select",
-          "default": "off",
-          "options": [
-            {
-              "value": "off",
-              "label": "Off"
-            },
-            {
-              "value": "on",
-              "label": "On (flatten final texture)"
-            }
-          ],
-          "tooltip": "Additional flattening pass on the final baked texture after delight. Use when the baked result still has unwanted shadows. Delight already flattens the reference — this catches any shadows introduced during baking."
-        },
-        {
           "id": "texture_diffusion_steps",
           "label": "Texture Diffusion Steps",
           "type": "number",
