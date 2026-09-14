@@ -171,15 +171,31 @@ def _composite_on_white(img):
     # 128 backdrop through; gray-backdrop references are out-of-distribution
     # for the paint model and made it hallucinate black/zebra side views.
     _arr = np.array(rgb)
-    _border = np.concatenate([_arr[0, :], _arr[-1, :], _arr[:, 0], _arr[:, -1]]).astype(int)
-    _med = np.median(_border, axis=0)
-    _p90 = float(np.percentile(np.abs(_border - _med).max(axis=1), 90))
-    if _p90 <= 25:
-        _fg = _subject_silhouette(_arr)
-        if 0.02 < float(_fg.mean()) < 0.98:
-            _out = _arr.copy()
-            _out[~_fg] = 255
-            return Image.fromarray(_out)
+    # Use corner patches (5x5) for background color — corners are almost always
+    # pure background, even when the subject touches the border edges.
+    _h, _w = _arr.shape[:2]
+    _patch = 5
+    _corners = np.concatenate([
+        _arr[:_patch, :_patch].reshape(-1, 3),
+        _arr[:_patch, -_patch:].reshape(-1, 3),
+        _arr[-_patch:, :_patch].reshape(-1, 3),
+        _arr[-_patch:, -_patch:].reshape(-1, 3),
+    ]).astype(int)
+    _corner_std = _corners.std(0).max()
+    if _corner_std > 20:
+        # Subject touches a corner — can't reliably estimate background
+        pass
+    else:
+        _bg_color = _corners.mean(0)
+        _border = np.concatenate([_arr[0, :], _arr[-1, :], _arr[:, 0], _arr[:, -1]]).astype(int)
+        _dev = np.abs(_border - _bg_color).max(axis=1)
+        _p90 = float(np.percentile(_dev, 90))
+        if _p90 <= 25:
+            _fg = _subject_silhouette(_arr, _bg_color=_bg_color, _T=max(40.0, min(100.0, 2.0 * _p90 + 15.0)))
+            if 0.02 < float(_fg.mean()) < 0.98:
+                _out = _arr.copy()
+                _out[~_fg] = 255
+                return Image.fromarray(_out)
     try:
         from rembg import remove, new_session
         sess = new_session(providers=["CPUExecutionProvider"])
@@ -195,7 +211,7 @@ def _composite_on_white(img):
         return rgb
 
 
-def _subject_silhouette(img_np, tol=None):
+def _subject_silhouette(img_np, tol=None, _bg_color=None, _T=None):
     """Foreground mask of a subject on a uniform (possibly vignetted) backdrop.
 
     Corner flood-fill (even with FLOODFILL_FIXED_RANGE) breaks on the mild
@@ -212,18 +228,27 @@ def _subject_silhouette(img_np, tol=None):
     with a shadow touching one edge has a BIMODAL border whose median
     deviation stays tiny while p90 exposes the second colour (that is what
     keeps real photos on the rembg path in _composite_on_white).
+
+    When called from _composite_on_white, _bg_color and _T are provided
+    (corner-based background, adaptive threshold) to handle subjects that
+    touch the border edges.
     """
     import cv2 as _cv
     arr = img_np.astype(np.int16)
-    border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]], axis=0)
-    med = np.median(border, axis=0)
-    p90 = float(np.percentile(np.abs(border - med).max(axis=1), 90))
-    # Wider than the border's own spread: a radial vignette is darkest at the
-    # corners (on the border) and brightest at the centre (never sampled), so
-    # the threshold must exceed the border p90 to swallow the whole backdrop.
-    # Genuinely low-contrast subjects (gray-on-gray) get swallowed too — the
-    # coverage guards then fall back gracefully instead of corrupting.
-    T = float(tol) if tol else max(30.0, min(90.0, 3.0 * p90 + 20.0))
+    if _bg_color is not None and _T is not None:
+        # Caller provided corner-based bg color and threshold
+        med = np.array(_bg_color)
+        T = float(_T)
+    else:
+        border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]], axis=0)
+        med = np.median(border, axis=0)
+        p90 = float(np.percentile(np.abs(border - med).max(axis=1), 90))
+        # Wider than the border's own spread: a radial vignette is darkest at the
+        # corners (on the border) and brightest at the centre (never sampled), so
+        # the threshold must exceed the border p90 to swallow the whole backdrop.
+        # Genuinely low-contrast subjects (gray-on-gray) get swallowed too — the
+        # coverage guards then fall back gracefully instead of corrupting.
+        T = float(tol) if tol else max(30.0, min(90.0, 3.0 * p90 + 20.0))
     dist = np.abs(arr - med).max(axis=2)
     bg = (dist < T).astype(np.uint8)
     _n, lab = _cv.connectedComponents(bg)
@@ -1287,12 +1312,12 @@ def texture_mesh(args):
         # four refs labels them ALL as front-camera views, which is
         # out-of-distribution and produced catastrophically corrupted views
         # (e.g. hallucinated backgrounds / holes on the right camera).
-        # Additional reference views (MV-Adapter grid, image folder) enter
-        # the bake through the hybrid/deform silhouette warp instead, which
-        # uses their real pixels directly and needs the diffusion model not
-        # to know about them.
+        # The multiview model was trained to accept multiple reference views.
+        # Pass all available references — the model conditions on them directly.
         _mv_model = pipeline.models["multiview_model"]
-        _refs = [cond_views[0]]
+        _refs = list(cond_views)
+        while len(_refs) < 4:
+            _refs.append(cond_views[0])
 
         # Report per-step progress by wrapping the scheduler's step() method.
         # Map the chosen number of diffusion steps onto the 58->72 progress band so
