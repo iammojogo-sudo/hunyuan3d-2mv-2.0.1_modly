@@ -178,7 +178,7 @@ def _composite_on_white(img):
     # Use corner patches (5x5) for background color — corners are almost always
     # pure background, even when the subject touches the border edges.
     _h, _w = _arr.shape[:2]
-    _patch = 5
+    _patch = max(3, min(24, min(_h, _w) // 100))
     _corners = np.concatenate([
         _arr[:_patch, :_patch].reshape(-1, 3),
         _arr[:_patch, -_patch:].reshape(-1, 3),
