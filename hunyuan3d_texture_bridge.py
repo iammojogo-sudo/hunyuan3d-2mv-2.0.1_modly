@@ -154,8 +154,12 @@ def _composite_on_white(img):
     if img.mode == "RGBA":
         alpha = np.array(img.getchannel("A"))
         if float((alpha > 250).mean()) > 0.95:
-            # Opaque alpha = treat as RGB, segment the background
-            img = img.convert("RGB")
+            # Fully-opaque alpha: the original behaviour was to paste onto
+            # white using the alpha mask, which for an all-opaque image
+            # returns the raw RGB unchanged. Do NOT segment here — segmenting
+            # eats shaded mid-tones of the subject that sit near the backdrop
+            # colour, which mangled the grid splits. Return raw.
+            return img.convert("RGB")
         else:
             white = Image.new("RGB", img.size, (255, 255, 255))
             white.paste(img, mask=img.getchannel("A"))
