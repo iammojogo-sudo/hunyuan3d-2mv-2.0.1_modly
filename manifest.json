@@ -277,7 +277,7 @@
               "label": "6 (front + left + back + right + top + bottom)"
             }
           ],
-          "tooltip": "How many reference images to feed the texture diffusion. 1 = use the whole image as a single reference. 2-6 = split the tiled image in reading order, auto-detecting 2x2/2x3/3x2 grid from aspect ratio."
+          "tooltip": "How many reference views you have wired in, in reading order (front, left, back, right, top, bottom). 1 = whole image as a single front reference. The diffusion model is only ever conditioned on the FRONT view (that is its trained mode; extra views corrupted it). In Hybrid/Deform mode every one of these references is still used: each is warped pixel-exact onto the mesh's silhouette from its matching camera and baked at full resolution, so more real reference views = more of the mesh covered by genuine photo detail instead of diffusion guesswork."
         },
         {
           "id": "delight",
@@ -363,14 +363,14 @@
             },
             {
               "value": "hybrid",
-              "label": "Hybrid (diffusion geometry + full-res refs via optical flow)"
+              "label": "Hybrid (real pixels on referenced views + diffusion elsewhere)"
             },
             {
               "value": "deform",
               "label": "Deform (warp reference views to mesh, full res)"
             }
           ],
-          "tooltip": "How to generate the texture views that get baked onto the mesh. 'Diffusion' runs Hunyuan3D-2 multiview diffusion (learns how the reference fits the mesh geometry, but capped at 512px per view). 'Hybrid' runs the same diffusion to learn the geometry, then warps each full-res reference onto that geometry with dense optical flow — full reference resolution with correct mesh fit. 'Deform' skips diffusion entirely: it warps each wired reference view so its silhouette matches the mesh's rendered silhouette at the same camera angle (silhouette warp handles scale/offset, not radical shape changes)."
+          "tooltip": "How to generate the texture views that get baked onto the mesh. 'Diffusion' runs Hunyuan3D-2 multiview diffusion (single front reference, 512px views; the model synthesizes every other view). 'Hybrid' runs the same diffusion for top/bottom, but every view you have a real reference for (MV-Adapter grid, image folder) is instead pixel-warped onto the mesh's rendered silhouette with a smooth thin-plate spline and baked at FULL resolution — real photo detail, no diffusion smearing, no invented panels. Best used with orthographic multiview references (e.g. the MV-Adapter grid). 'Deform' skips diffusion entirely: it warps each wired reference view so its silhouette matches the mesh's rendered silhouette (silhouette warp handles scale/offset, not radical shape changes)."
         }
       ]
     },

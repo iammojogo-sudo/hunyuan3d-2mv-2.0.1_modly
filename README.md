@@ -20,7 +20,7 @@ Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nod
 ### What was new in v2.0
 - **Automatic background removal** — rembg runs on every input image before processing. No toggle needed.
 - **Image Folder mode** — point to a folder of photos; filenames (`front`, `left`, `back`, `right`) determine grid placement. Auto-tiles and saves `folder_tiled.png` for reuse.
-- **Hybrid Reference Mode** — directly uses your reference images for front/left/back/right views and only synthesizes top/bottom. Requires orthographic/isometric references.
+- **Hybrid Reference Mode** — bakes your real reference pixels onto front/left/back/right via a smooth thin-plate-spline silhouette warp and only synthesizes top/bottom with diffusion. Best with orthographic/isometric references (e.g. the MV-Adapter grid).
 - **Delight toggle** — turn off to skip the delight model (~1.5 GB VRAM saved) and keep original colors.
 - **Progress tracking** — multiview diffusion step progress shown in the node status.
 - **Debug views** — per-view split outputs saved to a `views_split` folder for troubleshooting.
@@ -127,7 +127,7 @@ If filenames don't contain any of these keywords, they fill remaining slots alph
 5. Set **Reference Images** to how many views to use for conditioning
 6. Set **Reference Mode**:
    - `Diffusion` — multiview model generates all 6 views (smoother on spheres/organic shapes)
-   - `Hybrid` — directly uses your reference images for front/left/back/right and only synthesizes top/bottom (sharper alignment on boxes/hard-surface objects). **Only use Hybrid with orthographic/isometric reference views. Do not use with perspective photos or single-image inputs — choose Diffusion instead.**
+   - `Hybrid` — bakes your real reference pixels onto the views they cover (thin-plate-spline silhouette warp at full resolution) and synthesizes the rest with diffusion. Sharper on hard-surface objects; best with orthographic/isometric references like the MV-Adapter grid. Single photos are fine too — only the front view uses the photo, the rest come from diffusion.
 7. Set **Delight**:
    - `On` — runs the delight model to normalize lighting (can wash out colors, but may look more synthetic)
    - `Off` — skips the delight model, saves ~1.5 GB VRAM, keeps original image colors
@@ -140,8 +140,8 @@ If filenames don't contain any of these keywords, they fill remaining slots alph
 |-----------|-------------|
 | **Texture Resolution** | Higher = sharper but more VRAM. 1024 is the sweet spot |
 | **Decimate Faces** | Reduces mesh face count before UV unwrap. Lower = faster, less VRAM |
-| **Reference Images** | 1–4 views to condition the texture generation |
-| **Reference Mode** | Diffusion = model generates every view; Hybrid = use references for known views (requires orthographic/isometric refs — not for single/perspective photos) |
+| **Reference Images** | 1–6 real views wired in (front, left, back, right, top, bottom). Only the front view conditions the diffusion model (its trained mode); the rest are used directly in Hybrid/Deform bakes |
+| **Reference Mode** | Diffusion = model generates every view from the front ref; Hybrid = real pixels on covered views + diffusion for the rest (best with orthographic MV-Adapter refs) |
 | **Delight** | Off = keep real colors (saves ~1.5 GB VRAM). On = normalize lighting |
 | **Texture Diffusion Steps** | Number of multiview diffusion steps for texture generation (5-60). 5 = fast/rough, 30 = default, 60 = slow/sharp |
 | **Image Input Mode** | Single / Tiled / Folder |

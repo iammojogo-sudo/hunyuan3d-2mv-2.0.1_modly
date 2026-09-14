@@ -306,7 +306,10 @@ def _deform_view_to_silhouette(ref_img, pos_img, out_size):
     # warp(ref, inverse_map=tps) samples the reference at each mesh pixel.
     tps = ThinPlateSplineTransform()
     try:
-        tps.estimate(src=mesh_pts, dst=ref_pts)
+        try:
+            tps = ThinPlateSplineTransform.from_estimate(src=mesh_pts, dst=ref_pts)
+        except AttributeError:  # skimage < 0.26
+            tps.estimate(src=mesh_pts, dst=ref_pts)
     except Exception:
         return ref
 
@@ -332,68 +335,31 @@ def _deform_multiview(cond_views, position_maps, out_size):
     return out
 
 
-def _hybrid_flow_multiview(cond_views, diff_views, position_maps, out_size, flow_res=512):
-    """Warp the original full-res references to match the diffusion output.
+def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
+    """Per-view hybrid assembly: views backed by a real reference carry the
+    full-resolution ORIGINAL pixels warped onto the mesh silhouette with the
+    same thin-plate-spline used by deform mode; unreferenced views keep the
+    diffusion output.
 
-    The multiview diffusion model produces views with the CORRECT mesh geometry
-    but capped at 512px (its training resolution). This helper derives a dense
-    optical-flow field (Farneback) between each 512px diffusion view and the
-    corresponding reference, then applies it to the full-res reference. The
-    result is a full-resolution view with the diffusion model's geometry.
-
-    cond_views[i] is the reference for camera i (reading order == candidate
-    camera order). Views past the end of cond_views have no reference, so they
-    keep the diffusion output as-is (resized).
-    """
-    import cv2 as _cv
+    This replaced dense optical flow (Farneback) as the warp. Flow computed
+    between a photo and a diffusion render has no anchors in low-texture
+    regions (cream upholstery, flat walls): vectors drift freely and the
+    remap smears legs into streaks and shifts one side of a symmetric
+    silhouette higher than the other. The TPS fits only the outer contour
+    correspondence, so it is smooth by construction — worst case a slightly
+    displaced interior pattern, never tearing or smearing."""
     out = []
     for i, diff_view in enumerate(diff_views):
         _touch_activity()
-        try:
-            if i >= len(cond_views):
-                out.append(diff_view.convert("RGB").resize((out_size, out_size), Image.LANCZOS))
+        if i < len(ref_views):
+            try:
+                out.append(_deform_view_to_silhouette(
+                    ref_views[i], position_maps[i], out_size))
                 continue
-
-            ref = cond_views[i].convert("RGB")
-            diff = diff_view.convert("RGB")
-
-            # Downscale both to flow_res for the flow computation.
-            ref_low = ref.resize((flow_res, flow_res), Image.LANCZOS)
-            diff_low = diff.resize((flow_res, flow_res), Image.LANCZOS)
-            ref_g = np.asarray(ref_low.convert("L"), dtype=np.float32)
-            diff_g = np.asarray(diff_low.convert("L"), dtype=np.float32)
-
-            # Farneback(prev, next): next(x + flow) ~= prev(x). With
-            # prev=diff, next=ref each diff pixel's source lives at ref(x+flow).
-            flow = _cv.calcOpticalFlowFarneback(
-                diff_g, ref_g, None,
-                pyr_scale=0.5, levels=5, winsize=21, iterations=5,
-                poly_n=5, poly_sigma=1.2, flags=0)
-
-            scale = out_size / flow_res
-            flow_full = _cv.resize(flow, (out_size, out_size),
-                                   interpolation=_cv.INTER_LINEAR) * scale
-
-            ref_full = np.asarray(ref.resize((out_size, out_size), Image.LANCZOS), dtype=np.uint8)
-            yy, xx = np.meshgrid(np.arange(out_size), np.arange(out_size), indexing="ij")
-            map_x = (xx.astype(np.float32) + flow_full[..., 0]).clip(0, out_size - 1)
-            map_y = (yy.astype(np.float32) + flow_full[..., 1]).clip(0, out_size - 1)
-            warped = _cv.remap(ref_full, map_x, map_y, _cv.INTER_LINEAR,
-                               borderMode=_cv.BORDER_CONSTANT, borderValue=(255, 255, 255))
-
-            # Restrict the warped content to the mesh silhouette (position map)
-            # so background pixels can't bleed into the subject.
-            mesh_sil = _mesh_silhouette_from_pos(position_maps[i])
-            if (mesh_sil.shape[0], mesh_sil.shape[1]) != (out_size, out_size):
-                _u8 = Image.fromarray((mesh_sil * 255).astype(np.uint8)).resize(
-                    (out_size, out_size), Image.NEAREST)
-                mesh_sil = np.asarray(_u8) > 0
-            res = np.full((out_size, out_size, 3), 255, np.uint8)
-            res[mesh_sil] = warped[mesh_sil]
-            out.append(Image.fromarray(res, "RGB"))
-        except Exception as _e:
-            print(json.dumps({"type": "log", "message": f"[hybrid] view {i} failed ({_e}), using diffusion view"}), flush=True)
-            out.append(diff_view.convert("RGB").resize((out_size, out_size), Image.LANCZOS))
+            except Exception as _e:
+                print(json.dumps({"type": "log", "message":
+                    f"[hybrid] view {i} warp failed ({_e}), using diffusion view"}), flush=True)
+        out.append(diff_view.convert("RGB").resize((out_size, out_size), Image.LANCZOS))
     return out
 
 
@@ -570,9 +536,9 @@ def texture_mesh(args):
         # provided view gets full weight at the view boundaries.
         _dynamic_weights = [1.0] * 6
     elif texture_method == "hybrid":
-        # Hybrid views are the same ground-truth references (flow-warped to the
-        # diffusion geometry), but views past the reference count are diffusion
-        # output, so they keep the graduated weights.
+        # Hybrid reference-backed views are ground-truth originals (TPS-wrapped
+        # to the mesh silhouette), so they take full bake weight. Views past the
+        # reference count are diffusion output and keep the graduated weights.
         _dynamic_weights = [1.0 if _i < len(cond_views) else _known_weights[_i] for _i in range(6)]
     _view_weights_override = _dynamic_weights
     print(json.dumps({"type": "log", "message": f"[texture] dynamic view weights: {_view_weights_override}"}), flush=True)
@@ -1200,18 +1166,18 @@ def texture_mesh(args):
 
         report(58, "Multiview diffusion", "generating texture views")
 
-        # Let the multiview model use its NATIVE reference conditioning
-        # (ref_scale=[0.0, 1.0] by default). The model knows how to synthesize the
-        # unknown views from the provided reference(s): views that have a reference
-        # are rendered from it at full detail, and views without one are freely
-        # synthesized. We don't override ref_scale — manually forcing the adherence
-        # dial fights the model's own generation and produced chroma artifacts on
-        # unreferenced views. The only lever we keep is how many references to feed
-        # (reference_images), which tells the model which views have ground truth.
+        # Feed the multiview model its NATIVE conditioning: exactly ONE
+        # reference (front). paint-v2-0 was trained single-view, and the
+        # vendored multiview_utils hardcodes camera_info_ref=[[0]] — passing
+        # four refs labels them ALL as front-camera views, which is
+        # out-of-distribution and produced catastrophically corrupted views
+        # (e.g. hallucinated backgrounds / holes on the right camera).
+        # Additional reference views (MV-Adapter grid, image folder) enter
+        # the bake through the hybrid/deform silhouette warp instead, which
+        # uses their real pixels directly and needs the diffusion model not
+        # to know about them.
         _mv_model = pipeline.models["multiview_model"]
-        _refs = list(cond_views)
-        while len(_refs) < 4:
-            _refs.append(cond_views[0])
+        _refs = [cond_views[0]]
 
         # Report per-step progress by wrapping the scheduler's step() method.
         # Map the chosen number of diffusion steps onto the 58->72 progress band so
@@ -1239,12 +1205,13 @@ def texture_mesh(args):
             _mv_sched.step = _mv_orig_step
 
         if texture_method == "hybrid":
-            # Warp the untouched full-res originals to match the diffusion
-            # output's geometry (dense optical flow, applied at full res).
-            # Uses the raw snapshots, not the delight views, so baked pixels
-            # are the real reference colours/detail.
-            report(68, "Hybrid: warping originals to diffusion geometry", "optical flow")
-            multiviews = _hybrid_flow_multiview(
+            # Referenced views = full-res ORIGINAL pixels, warped onto the
+            # mesh silhouette with the smooth thin-plate-spline (no optical
+            # flow: it smeared low-texture regions). Unreferenced views
+            # (top/bottom) keep the diffusion output. Uses the raw snapshots,
+            # not the delight views, so baked pixels are real colours.
+            report(68, "Hybrid: warping originals onto mesh silhouettes", "thin-plate spline")
+            multiviews = _hybrid_warp_multiview(
                 _raw_cond_views, multiviews, position_maps, RENDER_RES)
         else:
             # Resize generated views to the render resolution for baking.
