@@ -487,31 +487,85 @@ def _deform_view_to_silhouette(ref_img, pos_img, out_size):
     return Image.fromarray(out, "RGB")
 
 
+def _sil_match_score(ref_img, pos_img, out_size):
+    """IoU between a reference's subject silhouette (bbox-aligned onto the
+    mesh silhouette) and the mesh's rendered silhouette. Cheap pre-warp test
+    used to detect mirrored left/right conventions between view generators
+    (MV-Adapter names left/right opposite to hunyuan's camera order)."""
+    mesh_sil = _mesh_silhouette_from_pos(pos_img)
+    if (mesh_sil.shape[0], mesh_sil.shape[1]) != (out_size, out_size):
+        _u8 = Image.fromarray((mesh_sil * 255).astype(np.uint8)).resize(
+            (out_size, out_size), Image.NEAREST)
+        mesh_sil = np.asarray(_u8) > 0
+    ref_sil = _subject_silhouette(np.array(ref_img.convert("RGB").resize(
+        (out_size, out_size), Image.LANCZOS)))
+    if not mesh_sil.any() or not ref_sil.any():
+        return 0.0
+    ry, rx = np.where(ref_sil)
+    my, mx = np.where(mesh_sil)
+    m_h, m_w = my.max() - my.min() + 1, mx.max() - mx.min() + 1
+    sub = ref_sil[ry.min():ry.max() + 1, rx.min():rx.max() + 1]
+    sub_r = np.asarray(Image.fromarray((sub * 255).astype(np.uint8)).resize(
+        (int(m_w), int(m_h)), Image.NEAREST)) > 127
+    canvas = np.zeros((out_size, out_size), bool)
+    canvas[my.min():my.min() + sub_r.shape[0], mx.min():mx.min() + sub_r.shape[1]] = sub_r
+    inter = float(np.logical_and(canvas, mesh_sil).sum())
+    union = float(np.logical_or(canvas, mesh_sil).sum())
+    return inter / max(union, 1.0)
+
+
 def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
     """Per-view hybrid assembly: views backed by a real reference carry the
     full-resolution ORIGINAL pixels warped onto the mesh silhouette with the
-    same thin-plate-spline used by deform mode; unreferenced views keep the
-    diffusion output.
+    thin-plate-spline; unreferenced views keep the diffusion output.
 
-    This replaced dense optical flow (Farneback) as the warp. Flow computed
-    between a photo and a diffusion render has no anchors in low-texture
-    regions (cream upholstery, flat walls): vectors drift freely and the
-    remap smears legs into streaks and shifts one side of a symmetric
-    silhouette higher than the other. The TPS fits only the outer contour
-    correspondence, so it is smooth by construction — worst case a slightly
-    displaced interior pattern, never tearing or smearing."""
+    Orientation auto-pick: for the two side cameras, both candidate side
+    references are scored against this camera's mesh silhouette and the
+    better fit is warped — this absorbs mirrored left/right naming between
+    view generators and hunyuan's camera order instead of shredding the warp.
+
+    Strict acceptance: a warp is only used when its subject actually covers
+    the mesh silhouette (coverage >= 0.90 and IoU >= 0.60). Rejected warps
+    fall back to the diffusion view for that camera, logged."""
     out = []
+    n_ref = len(ref_views)
     for i, diff_view in enumerate(diff_views):
         _touch_activity()
-        if i < len(ref_views):
+        fallback = diff_view.convert("RGB").resize((out_size, out_size), Image.LANCZOS)
+        if i < n_ref:
+            ref_idx = i
+            if i in (1, 3) and n_ref >= 4:
+                alt = 3 if i == 1 else 1
+                s_own = _sil_match_score(ref_views[i], position_maps[i], out_size)
+                s_alt = _sil_match_score(ref_views[alt], position_maps[i], out_size)
+                if s_alt > s_own + 0.05:
+                    ref_idx = alt
+                    print(json.dumps({"type": "log", "message":
+                        f"[hybrid] cam{i}: mirrored convention detected — using ref#{alt} "
+                        f"(sil iou {s_own:.2f} vs {s_alt:.2f})"}), flush=True)
             try:
-                out.append(_deform_view_to_silhouette(
-                    ref_views[i], position_maps[i], out_size))
-                continue
+                warped = _deform_view_to_silhouette(
+                    ref_views[ref_idx], position_maps[i], out_size)
+                wa = np.array(warped)
+                mesh_sil = _mesh_silhouette_from_pos(position_maps[i])
+                if (mesh_sil.shape[0], mesh_sil.shape[1]) != (out_size, out_size):
+                    mesh_sil = np.asarray(Image.fromarray(
+                        (mesh_sil * 255).astype(np.uint8)).resize(
+                        (out_size, out_size), Image.NEAREST)) > 0
+                wsub = _subject_silhouette(wa)
+                cov = float(np.logical_and(mesh_sil, wsub).sum()) / max(float(mesh_sil.sum()), 1.0)
+                iou = float(np.logical_and(wsub, mesh_sil).sum()) / max(
+                    float(np.logical_or(wsub, mesh_sil).sum()), 1.0)
+                if cov >= 0.90 and iou >= 0.60:
+                    out.append(warped)
+                    continue
+                print(json.dumps({"type": "log", "message":
+                    f"[hybrid] view {i} warp rejected (cov={cov:.2f}, iou={iou:.2f}) "
+                    f"— using diffusion view"}), flush=True)
             except Exception as _e:
                 print(json.dumps({"type": "log", "message":
                     f"[hybrid] view {i} warp failed ({_e}), using diffusion view"}), flush=True)
-        out.append(diff_view.convert("RGB").resize((out_size, out_size), Image.LANCZOS))
+        out.append(fallback)
     return out
 
 
@@ -615,7 +669,7 @@ def texture_mesh(args):
       render normal/position multiviews -> delight conditioning image ->
       multiview diffusion -> bake textures -> inpaint -> export GLB.
     """
-    BRIDGE_BUILD = "2026-09-14-deform-retired"
+    BRIDGE_BUILD = "2026-09-14-blendfix"
     print(json.dumps({"type": "log", "message":
         f"[texture] bridge build {BRIDGE_BUILD}"}), flush=True)
     _bridge_first_load(args)
@@ -693,10 +747,14 @@ def texture_mesh(args):
     for _i in range(_num_known):
         _dynamic_weights[_i] = _known_weights[_i]
     if texture_method == "hybrid":
-        # Hybrid reference-backed views are ground-truth originals (TPS-wrapped
+        # Hybrid reference-backed views are ground-truth originals (TPS-warped
         # to the mesh silhouette), so they take full bake weight. Views past the
-        # reference count are diffusion output and keep the graduated weights.
-        _dynamic_weights = [1.0 if _i < len(cond_views) else _known_weights[_i] for _i in range(6)]
+        # reference count are diffusion output and get graduated weights so they
+        # cannot ghost over a real reference where projections overlap (e.g. the
+        # top view bleeding onto the shoulders of the back reference).
+        _stock_grad = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
+        _dynamic_weights = [1.0 if _i < len(cond_views) else _stock_grad[_i]
+                            for _i in range(6)]
     _view_weights_override = _dynamic_weights
     print(json.dumps({"type": "log", "message": f"[texture] dynamic view weights: {_view_weights_override}"}), flush=True)
 
@@ -727,6 +785,23 @@ def texture_mesh(args):
             report(18, "Decimation done", f"{len(mesh.faces)} faces")
         except Exception as _dec_err:
             print(json.dumps({"type": "log", "message": f"[warn] decimation skipped: {_dec_err}"}), flush=True)
+
+    # Mesh sanity: flipped or inconsistent face winding makes back_project's
+    # cos map go negative, so those faces bake as HOLES no matter how many
+    # views cover them — and on the mesh they reappear as the obvious
+    # "doesn't blend" inpainted patches (inner arms, seat tops). Repair
+    # winding/normals in memory (vertex positions untouched) and log stats.
+    try:
+        _wind_before = bool(getattr(mesh, "is_winding_consistent", False))
+        _watertight = bool(getattr(mesh, "is_watertight", False))
+        trimesh.repair.fix_winding(mesh)
+        trimesh.repair.fix_normals(mesh)
+        print(json.dumps({"type": "log", "message":
+            f"[texture] mesh sanity: winding_consistent_before={_wind_before} "
+            f"watertight={_watertight} -> winding/normals repaired"}), flush=True)
+    except Exception as _nr_err:
+        print(json.dumps({"type": "log", "message":
+            f"[texture] mesh sanity skipped: {_nr_err}"}), flush=True)
 
     report(22, "Loading Hunyuan3D-2.0 paint models", "delight + multiview diffusion")
     # hy3dgen_path points at the Hunyuan3D-2 (2.0) folder so `hy3dgen.texgen`
@@ -1039,7 +1114,12 @@ def texture_mesh(args):
     pipeline.render.set_default_render_resolution(RENDER_RES)
     pipeline.render.set_default_texture_resolution(TEXTURE_SIZE)
 
-    pipeline.config.bake_exp = 4
+    # bake_exp 4 suppressed grazing-angle faces (inner arms, seat rims) into
+    # holes that inpaint then fills with detail-free patches. 2 keeps their
+    # real (stretched but textured) texels; frontal views still win the
+    # cos-weighted merge. Hole fraction is logged after bake so this stays
+    # measurable/revertable.
+    pipeline.config.bake_exp = 2
     pipeline.render.bake_angle_thres = 85
     pipeline.render.bake_unreliable_kernel_size = 2
 
@@ -1426,7 +1506,10 @@ def texture_mesh(args):
             _m = _fg_masks[_vi]
             _mv_lums.append(float(_lab[:, :, 0][_m].mean()) if _m is not None
                             else float(_lab[:, :, 0].mean()))
-        _target_lum = max(_mv_lums)
+        # Target the MEDIAN view luminance, not the max: max over-boosted the
+        # darker side views (washing legs to pale/metallic) whenever one view
+        # happened to be brightest. Median equalises without over-driving.
+        _target_lum = float(np.median(_mv_lums))
         _lum_ratios = [_target_lum / max(l, 1.0) for l in _mv_lums]
         _lum_ratios = [np.clip(r, 0.3, 4.0) for r in _lum_ratios]
         for _i, _v in enumerate(multiviews):
@@ -1527,6 +1610,9 @@ def texture_mesh(args):
     else:
         print(f"[debug] unexpected texture shape {_tex_np.shape}, skipping debug dump")
     Image.fromarray(mask_np).save(os.path.join(_debug_dir, "05_bake_mask.png"))
+    print(json.dumps({"type": "log", "message":
+        f"[texture] bake hole fraction: {float((mask_np < 128).mean()):.3f} "
+        f"(bake_exp={pipeline.config.bake_exp})"}), flush=True)
 
     # Inpaint is mandatory (fills UV gaps that would otherwise leave the mesh
     # black). Always run it.
@@ -1535,6 +1621,44 @@ def texture_mesh(args):
     _final = (texture.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
     if _final.ndim == 3 and _final.shape[2] in (3, 4):
         Image.fromarray(_final).save(os.path.join(_debug_dir, "06_inpainted_texture.png"))
+
+    # ── Inpaint blending: make filled holes match ON-MESH ──────────────────
+    # UV-inpaint fills are smooth and detail-free: seamless in the flat atlas
+    # photo but obvious on the mesh (mip filtering next to real projected
+    # weave — the "faces that don't blend" on inner arms / seat tops).
+    # Fix: graft the local high-frequency detail layer into the fills and
+    # feather their boundaries so patched faces read like their neighbours.
+    try:
+        import cv2 as _cv2_ib
+        _holes = (mask_np < 128).astype(np.uint8)
+        _hole_frac = float(_holes.mean())
+        if 0.0 < _hole_frac < 0.5:
+            _k3 = np.ones((3, 3), np.uint8)
+            # hole interior only; the 2-texel ring touching valid coverage
+            # already blends acceptably and is left alone
+            _holes_int = _holes & _cv2_ib.erode(_holes, _k3, iterations=2)
+            if _holes_int.sum() > 0:
+                _base = _final.astype(np.float32)
+                _k = int(max(5, (TEXTURE_SIZE // 512) * 5)) | 1
+                _kf = int(max(5, (TEXTURE_SIZE // 512) * 3)) | 1
+                _blur = _cv2_ib.GaussianBlur(_base, (_k, _k), 0)
+                _detail = _base - _blur
+                _det_img = np.clip(_detail + 128.0, 0, 255).astype(np.uint8)
+                _det_mask = (_cv2_ib.dilate(_holes_int, _k3, iterations=2) * 255).astype(np.uint8)
+                _det_inp = _cv2_ib.inpaint(
+                    _det_img, _det_mask, max(3, (TEXTURE_SIZE // 512) * 3),
+                    _cv2_ib.INPAINT_TELEA).astype(np.float32) - 128.0
+                _refined = np.clip(_blur + _det_inp, 0, 255)
+                _alpha = np.clip(_cv2_ib.GaussianBlur(
+                    _holes_int.astype(np.float32), (_kf, _kf), 0) * 1.5, 0.0, 1.0)[..., None]
+                _final = np.clip(_base * (1 - _alpha) + _refined * _alpha,
+                                 0, 255).astype(np.uint8)
+                print(json.dumps({"type": "log", "message":
+                    f"[texture] inpaint blending: hole_frac={_hole_frac:.3f} — "
+                    f"detail grafted + boundaries feathered"}), flush=True)
+    except Exception as _ib_err:
+        print(json.dumps({"type": "log", "message":
+            f"[texture] inpaint blending skipped: {_ib_err}"}), flush=True)
 
     # Flatten texture: remove all shadows/highlights to produce flat albedo.
     # Runs before final colour correction so the flatten doesn't undo the
