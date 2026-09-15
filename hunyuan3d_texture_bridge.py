@@ -520,21 +520,32 @@ def _guided_blend(warped_np, diff_np, mesh_sil):
     color, aligned detail) the reference's real pixels are kept; where they
     disagree (misaligned edges, background bleed, projection offset) the
     diffusion view's correct geometry wins.  Smooth Gaussian feathering at
-    silhouette boundaries eliminates any hard transition artefacts."""
+    silhouette boundaries eliminates any hard transition artefacts.  A final
+    edge cleanup pass replaces any residual background-colored pixels near
+    the silhouette boundary with the nearest subject color."""
     import cv2 as _cv2_gb
     warped_lab = _cv2_gb.cvtColor(warped_np, _cv2_gb.COLOR_RGB2LAB).astype(np.float32)
     diff_lab = _cv2_gb.cvtColor(diff_np, _cv2_gb.COLOR_RGB2LAB).astype(np.float32)
     dist = np.sqrt(np.sum((warped_lab - diff_lab) ** 2, axis=2))
-    # sigma=30 LAB units: below that is "same fabric", above is "mismatch"
     conf = np.exp(-dist / 30.0)
     conf = np.where(mesh_sil, conf, 0.0).astype(np.float32)
-    # Feather at silhouette boundary
     _h, _w = conf.shape
     _k = max(3, min(_h, _w) // 128 * 3) | 1
     conf = _cv2_gb.GaussianBlur(conf, (_k, _k), 0)
     conf = np.clip(conf, 0.0, 1.0)[..., None]
     blended = warped_np.astype(np.float32) * conf + diff_np.astype(np.float32) * (1.0 - conf)
-    return np.clip(blended, 0, 255).astype(np.uint8)
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    # Edge bleed cleanup: replace background-colored pixels near the
+    # silhouette boundary with nearest subject color via inpaint.
+    try:
+        _bsil = _subject_silhouette(blended).astype(np.uint8)
+        _bring = _cv2_gb.dilate(_bsil, np.ones((3, 3), np.uint8), iterations=3)
+        _bring = (_bring - _bsil).astype(np.uint8) * 255
+        if _bring.sum() > 0:
+            blended = _cv2_gb.inpaint(blended, _bring, 3, _cv2_gb.INPAINT_TELEA)
+    except Exception:
+        pass
+    return blended
 
 
 def _hybrid_warp_multiview(ref_views, diff_views, position_maps, out_size):
@@ -630,7 +641,15 @@ def _split_tiled_image(image_path, count=4):
         _ri = idx // _ncols
         _ci = idx % _ncols
         _cell = img.crop((_ci * _cw, _ri * _ch, (_ci + 1) * _cw, (_ri + 1) * _ch))
-        _views.append(_composite_on_white(_cell))
+        # Composite grid cells onto white using the improved segmentation.
+        # The corner-based _subject_silhouette correctly isolates the subject
+        # from the model's flat gray backdrop without eating the subject.
+        _arr = np.array(_cell.convert("RGB"))
+        _fg = _subject_silhouette(_arr)
+        if 0.02 < float(_fg.mean()) < 0.98:
+            _arr[~_fg] = 255
+            _cell = Image.fromarray(_arr)
+        _views.append(_cell)
     return _views
 
 
@@ -968,6 +987,9 @@ def texture_mesh(args):
     def _delight_call_patched(self, image):
         import numpy as _np
         import cv2 as _cv2
+        # Save the original at 512 so we can restore its edge pixels after
+        # the delight model's edge artifacts (halos, color shifts, outline).
+        _orig_512 = image.convert("RGB").resize((512, 512))
         image = image.resize((512, 512))
         if image.mode == 'RGBA':
             image_array = _np.array(image)
@@ -1005,6 +1027,23 @@ def texture_mesh(args):
         # the global palette honest; per-view lighting equalisation happens
         # later in the luminance-balance step.
         image = _remove_silhouette_outline(image)
+        # Restore original edges: the delight model + outline removal create
+        # halos and colour shifts at subject boundaries ("separation").  Blend
+        # the original's edge pixels back using a feathered subject mask so
+        # interior keeps delight's lighting while edges preserve original detail.
+        try:
+            _orig_mask = _subject_silhouette(np.array(_orig_512))
+            if float(_orig_mask.mean()) > 0.02:
+                _k = max(5, min(15, 512 // 50)) | 1
+                _mask_f = _cv2.GaussianBlur(
+                    _orig_mask.astype(np.float32), (_k, _k), 0)[..., None]
+                _del_np = np.array(image).astype(np.float32)
+                _orig_np = np.array(_orig_512).astype(np.float32)
+                image = Image.fromarray(np.clip(
+                    _del_np * _mask_f + _orig_np * (1.0 - _mask_f),
+                    0, 255).astype(np.uint8))
+        except Exception:
+            pass
         try:
             _dm = _subject_silhouette(np.array(image))
             if not (0.02 < float(_dm.mean()) < 0.98):
