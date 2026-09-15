@@ -641,15 +641,7 @@ def _split_tiled_image(image_path, count=4):
         _ri = idx // _ncols
         _ci = idx % _ncols
         _cell = img.crop((_ci * _cw, _ri * _ch, (_ci + 1) * _cw, (_ri + 1) * _ch))
-        # Composite grid cells onto white using the improved segmentation.
-        # The corner-based _subject_silhouette correctly isolates the subject
-        # from the model's flat gray backdrop without eating the subject.
-        _arr = np.array(_cell.convert("RGB"))
-        _fg = _subject_silhouette(_arr)
-        if 0.02 < float(_fg.mean()) < 0.98:
-            _arr[~_fg] = 255
-            _cell = Image.fromarray(_arr)
-        _views.append(_cell)
+        _views.append(_cell.convert("RGB"))
     return _views
 
 

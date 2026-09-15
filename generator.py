@@ -895,7 +895,6 @@ class Hunyuan3DmvGenerator(BaseGenerator):
             "paint_subfolder": paint_subfolder,
             "reference_images": int(params.get("reference_images", 4) or 4),
             "delight": str(params.get("delight", "off") or "off").lower(),
-            "flatten_texture": str(params.get("flatten_texture", "off") or "off").lower(),
             "texture_diffusion_steps": int(params.get("texture_diffusion_steps", 30) or 30),
             "texture_method": str(params.get("texture_method", "diffusion") or "diffusion").lower(),
         }
